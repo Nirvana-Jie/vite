@@ -277,15 +277,29 @@ async function loadAndTransform(
       ++sourcesIndex
     ) {
       const sourcePath = map.sources[sourcesIndex]
+      if (!sourcePath) continue
+
+      const sourcemapPath = `${mod.file}.map`
+      const ignoreList = config.server.sourcemapIgnoreList(
+        sourcePath,
+        sourcemapPath,
+      )
+      if (typeof ignoreList !== 'boolean') {
+        logger.warn('sourcemapIgnoreList function must return a boolean.')
+      }
+      if (ignoreList) {
+        if (map.x_google_ignoreList === undefined) {
+          map.x_google_ignoreList = []
+        }
+        if (!map.x_google_ignoreList.includes(sourcesIndex)) {
+          map.x_google_ignoreList.push(sourcesIndex)
+        }
+      }
 
       // Rewrite sources to relative paths to give debuggers the chance
       // to resolve and display them in a meaningful way (rather than
       // with absolute paths).
-      if (
-        sourcePath &&
-        path.isAbsolute(sourcePath) &&
-        path.isAbsolute(mod.file)
-      ) {
+      if (path.isAbsolute(sourcePath) && path.isAbsolute(mod.file)) {
         map.sources[sourcesIndex] = path.relative(
           path.dirname(mod.file),
           sourcePath,
