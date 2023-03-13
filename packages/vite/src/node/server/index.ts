@@ -23,6 +23,7 @@ import {
 import type { InlineConfig, ResolvedConfig } from '../config'
 import { isDepsOptimizerEnabled, resolveConfig } from '../config'
 import {
+  diffDnsOrderChange,
   isParentDirectory,
   mergeConfig,
   normalizePath,
@@ -359,7 +360,8 @@ export async function createServer(
   }
 
   const watcher = chokidar.watch(
-    path.resolve(root),
+    // config file dependencies and env file might be outside of root
+    [root, ...config.configFileDependencies, config.envDir],
     resolvedWatchOptions,
   ) as FSWatcher
 
@@ -813,7 +815,7 @@ async function restartServer(server: ViteDevServer) {
   global.__vite_start_time = performance.now()
   const { port: prevPort, host: prevHost } = server.config.server
   const shortcutsOptions: BindShortcutsOptions = server._shortcutsOptions
-
+  const oldUrls = server.resolvedUrls
   await server.close()
 
   let inlineConfig = server.config.inlineConfig
@@ -850,7 +852,8 @@ async function restartServer(server: ViteDevServer) {
     logger.info('server restarted.', { timestamp: true })
     if (
       (port ?? DEFAULT_DEV_PORT) !== (prevPort ?? DEFAULT_DEV_PORT) ||
-      host !== prevHost
+      host !== prevHost ||
+      diffDnsOrderChange(oldUrls, newServer.resolvedUrls)
     ) {
       logger.info('')
       server.printUrls()
