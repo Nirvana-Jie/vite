@@ -1,13 +1,12 @@
 import { defineConfig } from 'vite'
 
-/** @type {import('vite').UserConfig} */
-// @ts-expect-error typecast
 export default defineConfig({
   define: {
     __EXP__: 'false',
     __STRING__: '"hello"',
     __NUMBER__: 123,
     __BOOLEAN__: true,
+    __UNDEFINED__: undefined,
     __OBJ__: {
       foo: 1,
       bar: {

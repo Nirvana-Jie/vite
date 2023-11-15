@@ -1,12 +1,12 @@
-import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import fsp from 'node:fs/promises'
 import type { Connect } from 'dep-types/connect'
 import colors from 'picocolors'
+import type { ExistingRawSourceMap } from 'rollup'
 import type { ViteDevServer } from '..'
 import {
   cleanUrl,
   createDebugger,
-  ensureVolumeInPath,
   fsPathFromId,
   injectQuery,
   isImportRequest,
@@ -16,9 +16,11 @@ import {
   removeImportQuery,
   removeTimestampQuery,
   unwrapId,
+  withTrailingSlash,
 } from '../../utils'
 import { send } from '../send'
 import { ERR_LOAD_URL, transformRequest } from '../transformRequest'
+import { applySourcemapIgnoreList } from '../sourcemap'
 import { isHTMLProxy } from '../../plugins/html'
 import {
   DEP_VERSION_RE,
@@ -34,21 +36,17 @@ import {
   ERR_OPTIMIZE_DEPS_PROCESSING_ERROR,
   ERR_OUTDATED_OPTIMIZED_DEP,
 } from '../../plugins/optimizedDeps'
+import { ERR_CLOSED_SERVER } from '../pluginContainer'
 import { getDepsOptimizer } from '../../optimizer'
+import { urlRE } from '../../plugins/asset'
 
 const debugCache = createDebugger('vite:cache')
-const isDebug = !!process.env.DEBUG
 
 const knownIgnoreList = new Set(['/', '/favicon.ico'])
 
 export function transformMiddleware(
   server: ViteDevServer,
 ): Connect.NextHandleFunction {
-  const {
-    config: { root, logger },
-    moduleGraph,
-  } = server
-
   // Keep the named function. The name is visible in debug logs via `DEBUG=connect:dispatcher ...`
   return async function viteTransformMiddleware(req, res, next) {
     if (req.method !== 'GET' || knownIgnoreList.has(req.url!)) {
@@ -75,14 +73,22 @@ export function transformMiddleware(
         if (depsOptimizer?.isOptimizedDepUrl(url)) {
           // If the browser is requesting a source map for an optimized dep, it
           // means that the dependency has already been pre-bundled and loaded
-          const mapFile = url.startsWith(FS_PREFIX)
+          const sourcemapPath = url.startsWith(FS_PREFIX)
             ? fsPathFromId(url)
-            : normalizePath(
-                ensureVolumeInPath(path.resolve(root, url.slice(1))),
-              )
+            : normalizePath(path.resolve(server.config.root, url.slice(1)))
           try {
-            const map = await fs.readFile(mapFile, 'utf-8')
-            return send(req, res, map, 'json', {
+            const map = JSON.parse(
+              await fsp.readFile(sourcemapPath, 'utf-8'),
+            ) as ExistingRawSourceMap
+
+            applySourcemapIgnoreList(
+              map,
+              sourcemapPath,
+              server.config.server.sourcemapIgnoreList,
+              server.config.logger,
+            )
+
+            return send(req, res, JSON.stringify(map), 'json', {
               headers: server.config.server.headers,
             })
           } catch (e) {
@@ -91,7 +97,7 @@ export function transformMiddleware(
             // Send back an empty source map so the browser doesn't issue warnings
             const dummySourceMap = {
               version: 3,
-              file: mapFile.replace(/\.map$/, ''),
+              file: sourcemapPath.replace(/\.map$/, ''),
               sources: [],
               sourcesContent: [],
               names: [],
@@ -104,8 +110,9 @@ export function transformMiddleware(
           }
         } else {
           const originalUrl = url.replace(/\.map($|\?)/, '$1')
-          const map = (await moduleGraph.getModuleByUrl(originalUrl, false))
-            ?.transformResult?.map
+          const map = (
+            await server.moduleGraph.getModuleByUrl(originalUrl, false)
+          )?.transformResult?.map
           if (map) {
             return send(req, res, JSON.stringify(map), 'json', {
               headers: server.config.server.headers,
@@ -119,31 +126,39 @@ export function transformMiddleware(
       // check if public dir is inside root dir
       const publicDir = normalizePath(server.config.publicDir)
       const rootDir = normalizePath(server.config.root)
-      if (publicDir.startsWith(rootDir)) {
+      if (publicDir.startsWith(withTrailingSlash(rootDir))) {
         const publicPath = `${publicDir.slice(rootDir.length)}/`
         // warn explicit public paths
-        if (url.startsWith(publicPath)) {
+        if (url.startsWith(withTrailingSlash(publicPath))) {
           let warning: string
 
           if (isImportRequest(url)) {
             const rawUrl = removeImportQuery(url)
-
-            warning =
-              'Assets in public cannot be imported from JavaScript.\n' +
-              `Instead of ${colors.cyan(
-                rawUrl,
-              )}, put the file in the src directory, and use ${colors.cyan(
-                rawUrl.replace(publicPath, '/src/'),
-              )} instead.`
+            if (urlRE.test(url)) {
+              warning =
+                `Assets in the public directory are served at the root path.\n` +
+                `Instead of ${colors.cyan(rawUrl)}, use ${colors.cyan(
+                  rawUrl.replace(publicPath, '/'),
+                )}.`
+            } else {
+              warning =
+                'Assets in public directory cannot be imported from JavaScript.\n' +
+                `If you intend to import that asset, put the file in the src directory, and use ${colors.cyan(
+                  rawUrl.replace(publicPath, '/src/'),
+                )} instead of ${colors.cyan(rawUrl)}.\n` +
+                `If you intend to use the URL of that asset, use ${colors.cyan(
+                  injectQuery(rawUrl.replace(publicPath, '/'), 'url'),
+                )}.`
+            }
           } else {
             warning =
-              `files in the public directory are served at the root path.\n` +
+              `Files in the public directory are served at the root path.\n` +
               `Instead of ${colors.cyan(url)}, use ${colors.cyan(
                 url.replace(publicPath, '/'),
               )}.`
           }
 
-          logger.warn(colors.yellow(warning))
+          server.config.logger.warn(colors.yellow(warning))
         }
       }
 
@@ -173,10 +188,10 @@ export function transformMiddleware(
         const ifNoneMatch = req.headers['if-none-match']
         if (
           ifNoneMatch &&
-          (await moduleGraph.getModuleByUrl(url, false))?.transformResult
+          (await server.moduleGraph.getModuleByUrl(url, false))?.transformResult
             ?.etag === ifNoneMatch
         ) {
-          isDebug && debugCache(`[304] ${prettifyUrl(url, root)}`)
+          debugCache?.(`[304] ${prettifyUrl(url, server.config.root)}`)
           res.statusCode = 304
           return res.end()
         }
@@ -204,16 +219,33 @@ export function transformMiddleware(
         // Skip if response has already been sent
         if (!res.writableEnded) {
           res.statusCode = 504 // status code request timeout
+          res.statusMessage = 'Optimize Deps Processing Error'
           res.end()
         }
         // This timeout is unexpected
-        logger.error(e.message)
+        server.config.logger.error(e.message)
         return
       }
       if (e?.code === ERR_OUTDATED_OPTIMIZED_DEP) {
         // Skip if response has already been sent
         if (!res.writableEnded) {
           res.statusCode = 504 // status code request timeout
+          res.statusMessage = 'Outdated Optimize Dep'
+          res.end()
+        }
+        // We don't need to log an error in this case, the request
+        // is outdated because new dependencies were discovered and
+        // the new pre-bundle dependencies have changed.
+        // A full-page reload has been issued, and these old requests
+        // can't be properly fulfilled. This isn't an unexpected
+        // error but a normal part of the missing deps discovery flow
+        return
+      }
+      if (e?.code === ERR_CLOSED_SERVER) {
+        // Skip if response has already been sent
+        if (!res.writableEnded) {
+          res.statusCode = 504 // status code request timeout
+          res.statusMessage = 'Outdated Request'
           res.end()
         }
         // We don't need to log an error in this case, the request

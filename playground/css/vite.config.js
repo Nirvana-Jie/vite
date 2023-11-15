@@ -9,11 +9,18 @@ globalThis.window = {}
 // @ts-expect-error refer to https://github.com/vitejs/vite/pull/11079
 globalThis.location = new URL('http://localhost/')
 
-/** @type {import('vite').UserConfig} */
-// @ts-expect-error typecast
 export default defineConfig({
   build: {
     cssTarget: 'chrome61',
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('manual-chunk.css')) {
+            return 'dir/dir2/manual-chunk'
+          }
+        },
+      },
+    },
   },
   esbuild: {
     logOverride: {
